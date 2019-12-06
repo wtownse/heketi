@@ -65,6 +65,7 @@ func (c *CmdExecutor) lvmCommand() string {
 	return "/usr/sbin/lvm"
 }
 
+<<<<<<< HEAD
 func (c *CmdExecutor) udevCommand() string {
 	if wrapper := c.LVMWrapper(); wrapper != "" {
 		return wrapper + " /usr/bin/udevadm"
@@ -73,6 +74,8 @@ func (c *CmdExecutor) udevCommand() string {
 	return "/usr/bin/udevadm"
 }
 
+=======
+>>>>>>> 68f78cde... cmdexec: add lvmCommand() and LVMWrapper()
 func setWithEnvVariables(config *CmdConfig) {
 	var env string
 
