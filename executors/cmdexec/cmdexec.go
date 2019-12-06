@@ -66,8 +66,6 @@ func (c *CmdExecutor) lvmCommand() string {
 	return "/usr/sbin/lvm"
 }
 
-
-
 func (c *CmdExecutor) udevCommand() string {
 	if wrapper := c.LVMWrapper(); wrapper != "" {
 		return wrapper + " /usr/bin/udevadm"
