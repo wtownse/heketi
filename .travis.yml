@@ -5,6 +5,7 @@ before_install:
     - sudo apt-get update -qq
     - sudo apt-get install -qq python python-pip
     - sudo pip install tox nose
+    - sudo chown -R travis:travis /home/travis/.cache/pip
 install:
 - bash .travis-fork-fix
 - go get github.com/mattn/goveralls
@@ -23,6 +24,7 @@ git:
   depth: 9999999
 matrix:
   include:
+<<<<<<< HEAD
   - go: "1.10"
     name: Test using Go 1.10
     arch: amd64
@@ -45,5 +47,31 @@ matrix:
   - go: "1.13"
     name: Test using Go 1.13
     arch: s390x
+=======
+    - go: "1.10"
+      name: Test using Go 1.10
+      arch: amd64
+    - go: "1.11"
+      name: Test using Go 1.11
+      arch: amd64
+    - go: "1.13"
+      name: Test using Go 1.13
+      arch: amd64
+    - go: "1.13"
+      script: make release
+      name: make release on Go 1.13
+      arch: amd64
+    - go: "1.10"
+      name: Test using Go 1.10 on s390
+      arch: s390x
+    - go: "1.11"
+      name: Test using Go 1.11 on s390
+      arch: s390x
+    - go: "1.14"
+      name: Test using Go 1.14 on s390
+      arch: s390x
+  allow_failures:
+    - arch: s390x    
+>>>>>>> upstream/master
 script:
 - make all test COVERAGE=true TESTOPTIONS="-vcstdout" && bash .travis-coverage

@@ -14,6 +14,7 @@ import (
 
 	"github.com/heketi/heketi/executors"
 	wdb "github.com/heketi/heketi/pkg/db"
+	"github.com/heketi/heketi/pkg/glusterfs/api"
 
 	"github.com/boltdb/bolt"
 )
@@ -26,18 +27,51 @@ type DeviceRemoveOperation struct {
 	OperationManager
 	noRetriesOperation
 	DeviceId string
+
+	healCheck api.HealInfoCheck
+
+	// we need state gathered by clean in clean-done in the child operation
+	// we can't always pull the op from the db or we lose this state.
+	// This field is used to retain that state between calls.
+	currentChild *BrickEvictOperation
 }
 
 func NewDeviceRemoveOperation(
-	deviceId string, db wdb.DB) *DeviceRemoveOperation {
+	deviceId string, db wdb.DB, h api.HealInfoCheck) *DeviceRemoveOperation {
 
 	return &DeviceRemoveOperation{
 		OperationManager: OperationManager{
 			db: db,
 			op: NewPendingOperationEntry(NEW_ID),
 		},
-		DeviceId: deviceId,
+		DeviceId:  deviceId,
+		healCheck: h,
 	}
+}
+
+// loadDeviceRemoveOperation returns a DeviceRemoveOperation populated
+// from an existing pending operation entry in the db.
+func loadDeviceRemoveOperation(
+	db wdb.DB, p *PendingOperationEntry) (*DeviceRemoveOperation, error) {
+
+	var deviceId string
+	for _, action := range p.Actions {
+		if action.Change == OpRemoveDevice {
+			deviceId = action.Id
+		}
+	}
+	if deviceId == "" {
+		return nil, fmt.Errorf(
+			"Missing device to remove in device-remove operation")
+	}
+
+	return &DeviceRemoveOperation{
+		OperationManager: OperationManager{
+			db: db,
+			op: p,
+		},
+		DeviceId: deviceId,
+	}, nil
 }
 
 func (dro *DeviceRemoveOperation) Label() string {
@@ -115,11 +149,149 @@ func (dro *DeviceRemoveOperation) Exec(executor executors.Executor) error {
 		return e
 	}
 
-	return d.removeBricksFromDevice(dro.db, executor)
+	return dro.migrateBricks(executor, d)
+}
+
+func (dro *DeviceRemoveOperation) migrateBricks(
+	executor executors.Executor, d *DeviceEntry) error {
+
+	toEvict, err := d.removeableBricks(dro.db)
+	if err != nil {
+		return err
+	}
+	for _, brickId := range toEvict {
+		nestedOp := newRemoveBrickComboOperation(
+			dro,
+			NewBrickEvictOperation(brickId, dro.db, dro.healCheck))
+		err = RunOperation(nestedOp, executor)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (dro *DeviceRemoveOperation) updateChildOperation(
+	db wdb.DB, childOp *PendingOperationEntry) error {
+
+	return db.Update(func(tx *bolt.Tx) error {
+		var err error
+		dro.op, err = NewPendingOperationEntryFromId(tx, dro.op.Id)
+		if err != nil {
+			return err
+		}
+		dro.op.RecordChild(childOp)
+		// RecordChild alters both parent and child so save them both
+		if err := childOp.Save(tx); err != nil {
+			return err
+		}
+		if err := dro.op.Save(tx); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func (dro *DeviceRemoveOperation) clearChildOperation(db wdb.DB) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		var err error
+		dro.op, err = NewPendingOperationEntryFromId(tx, dro.op.Id)
+		if err != nil {
+			return err
+		}
+		dro.op.ClearChild()
+		return dro.op.Save(tx)
+	})
 }
 
 func (dro *DeviceRemoveOperation) Rollback(executor executors.Executor) error {
+	return rollbackViaClean(dro, executor)
+}
+
+func (dro *DeviceRemoveOperation) loadOpAndChild(
+	tx *bolt.Tx) (*BrickEvictOperation, error) {
+
+	var err error
+	dro.op, err = NewPendingOperationEntryFromId(tx, dro.op.Id)
+	if err != nil {
+		return nil, err
+	}
+	childId := dro.op.ChildId()
+	if childId == "" {
+		// no child op present in db. either the system was stopped
+		// between child-op updates or this is an old device-remove
+		// from a previous version. Either way there's nothing to do.
+		return nil, nil
+	}
+	childOp, err := NewPendingOperationEntryFromId(tx, childId)
+	if err != nil {
+		return nil, err
+	}
+	op, err := LoadOperation(wdb.WrapTx(tx), childOp)
+	if err != nil {
+		return nil, err
+	}
+	if bop, ok := op.(*BrickEvictOperation); ok {
+		return bop, nil
+	}
+	return nil, fmt.Errorf("unexpected child operation %v", childOp.Id)
+}
+
+func (dro *DeviceRemoveOperation) Clean(executor executors.Executor) error {
+	var brickEvictOp *BrickEvictOperation
+	err := dro.db.View(func(tx *bolt.Tx) error {
+		bop, err := dro.loadOpAndChild(tx)
+		brickEvictOp = bop
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if brickEvictOp != nil {
+		logger.Info("need to clean child [%s] of %s [%s]",
+			brickEvictOp.Id(), dro.Label(), dro.Id())
+		// annoyingly, we need to change the brick evict operations db
+		// to our db because it was created in the View txn above.
+		// only to need to swap it around later :-(
+		brickEvictOp.db = dro.db
+		dro.currentChild = brickEvictOp
+		nestedOp := newRemoveBrickComboOperation(dro, dro.currentChild)
+		return nestedOp.Clean(executor)
+	}
+	return nil
+}
+
+func (dro *DeviceRemoveOperation) CleanDone() error {
+	err := dro.db.View(func(tx *bolt.Tx) error {
+		bop, err := dro.loadOpAndChild(tx)
+		if bop == nil && dro.currentChild != nil {
+			return fmt.Errorf("db has no child op. operation has child!")
+		} else if bop != nil && dro.currentChild == nil {
+			return fmt.Errorf("db has child op. operation has no child!")
+		}
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if dro.currentChild != nil {
+		logger.Info("need to finish clean child [%s] of %s [%s]",
+			dro.currentChild.Id(), dro.Label(), dro.Id())
+		nestedOp := newRemoveBrickComboOperation(dro, dro.currentChild)
+		if err := nestedOp.CleanDone(); err != nil {
+			return err
+		}
+	}
 	return dro.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		dro.op, err = NewPendingOperationEntryFromId(tx, dro.op.Id)
+		if err != nil {
+			return err
+		}
+		if dro.op.IsParent() {
+			// child should have already been cleaned
+			return fmt.Errorf("device remove is still parent in clean done")
+		}
 		dro.op.Delete(tx)
 		return nil
 	})
@@ -142,6 +314,14 @@ func (dro *DeviceRemoveOperation) Finalize() error {
 	})
 }
 
+type replaceStatus int
+
+const (
+	replaceStatusUnknown replaceStatus = iota
+	replaceIncomplete
+	replaceComplete
+)
+
 // BrickEvictOperation removes exactly one brick from a volume
 // automatically replacing it to maintain any other volume restrictions.
 type BrickEvictOperation struct {
@@ -149,13 +329,14 @@ type BrickEvictOperation struct {
 	noRetriesOperation
 	BrickId string
 
+	healCheck api.HealInfoCheck
+
 	// internal caching params
-	replaceBrickSet  *BrickSet
-	replaceIndex     int
-	newBrickEntryId  string
-	newDeviceEntryId string
-	reclaimed        ReclaimMap
-	wasReplaced      bool
+	replaceBrickSet *BrickSet
+	replaceIndex    int
+	newBrickEntryId string
+	reclaimed       ReclaimMap
+	replaceResult   replaceStatus
 }
 
 type brickContext struct {
@@ -172,14 +353,15 @@ func (bc brickContext) bhmap() brickHostMap {
 }
 
 func NewBrickEvictOperation(
-	brickId string, db wdb.DB) *BrickEvictOperation {
+	brickId string, db wdb.DB, h api.HealInfoCheck) *BrickEvictOperation {
 
 	return &BrickEvictOperation{
 		OperationManager: OperationManager{
 			db: db,
 			op: NewPendingOperationEntry(NEW_ID),
 		},
-		BrickId: brickId,
+		BrickId:   brickId,
+		healCheck: h,
 	}
 }
 
@@ -271,6 +453,10 @@ func (beo *BrickEvictOperation) buildNewBrick(bs *BrickSet, index int) error {
 		if err != nil {
 			return err
 		}
+		logger.Debug(
+			"brick evict wants to replace [%s] on [%s] with [%s] on [%s]",
+			old.brick.Id(), old.device.Id(),
+			newBrickEntry.Id(), newDeviceEntry.Id())
 		// update pending op with new brick info
 		for _, action := range beo.op.Actions {
 			if action.Change == OpAddBrick {
@@ -285,9 +471,8 @@ func (beo *BrickEvictOperation) buildNewBrick(bs *BrickSet, index int) error {
 		if e := newBrickEntry.Save(tx); e != nil {
 			return e
 		}
-		// update operation cached entries for new brick and device entries
+		// update operation cached entries for new brick
 		beo.newBrickEntryId = newBrickEntry.Id()
-		beo.newDeviceEntryId = newDeviceEntry.Id()
 		return nil
 	})
 }
@@ -327,7 +512,11 @@ func (beo *BrickEvictOperation) execGetReplacmentInfo(
 	if err != nil {
 		return err
 	}
-	node := old.node.ManageHostName()
+
+	node, err := getWorkingNode(old.node, beo.db, executor)
+	if err != nil {
+		return err
+	}
 
 	bs, index, err := old.volume.getBrickSetForBrickId(
 		beo.db, executor, old.brick.Info.Id, node)
@@ -335,9 +524,13 @@ func (beo *BrickEvictOperation) execGetReplacmentInfo(
 		return err
 	}
 
-	err = old.volume.canReplaceBrickInBrickSet(beo.db, executor, node, bs, index)
-	if err != nil {
-		return err
+	if beo.healCheck != api.HealCheckDisable {
+		err = old.volume.canReplaceBrickInBrickSet(beo.db, executor, node, bs, index)
+		if err != nil {
+			return err
+		}
+	} else {
+		logger.Info("Skipping heal info check for volume %+v", old.volume)
 	}
 	beo.replaceBrickSet = bs
 	beo.replaceIndex = index
@@ -386,18 +579,19 @@ func (beo *BrickEvictOperation) execReplaceBrick(
 	newBrick.Path = newBrickEntry.Info.Path
 	newBrick.Host = newBrickNodeEntry.StorageHostName()
 
-	node := newBrickNodeEntry.ManageHostName()
+	node, err := getWorkingNode(newBrickNodeEntry, beo.db, executor)
+	if err != nil {
+		return err
+	}
+
 	err = executor.VolumeReplaceBrick(
 		node, old.volume.Info.Name, &oldBrick, &newBrick)
 	if err != nil {
 		return err
 	}
 
-	beo.reclaimed, err = old.bhmap().destroy(executor)
-	if err != nil {
-		return logger.LogError("Error destroying old brick: %v", err)
-	}
-	return nil
+	beo.reclaimed, err = tryDestroyBrickMap(old.bhmap(), executor)
+	return err
 }
 
 func (beo *BrickEvictOperation) Exec(executor executors.Executor) error {
@@ -469,7 +663,11 @@ func (beo *BrickEvictOperation) Clean(executor executors.Executor) error {
 	if err != nil {
 		return err
 	}
-	node := old.node.ManageHostName() // TODO: try on multiple nodes?
+	node, err := getWorkingNode(old.node, beo.db, executor)
+	if err != nil {
+		return nil
+	}
+
 	vinfo, err := executor.VolumeInfo(node, old.volume.Info.Name)
 	if err != nil {
 		logger.LogError("Unable to get volume info from gluster node %v for volume %v: %v", node, old.volume.Info.Name, err)
@@ -499,12 +697,14 @@ func (beo *BrickEvictOperation) Clean(executor executors.Executor) error {
 		if err != nil {
 			return err
 		}
+		// default to assuming old brick is still in use by gluster
+		beo.replaceResult = replaceIncomplete
 		for _, gbrick := range vinfo.Bricks.BrickList {
 			if _, found := bmap[gbrick.Name]; found {
 				logger.Info(
 					"Found existing gluster brick in volume: %v", gbrick.Name)
 			} else if newBrickHostPath == gbrick.Name {
-				beo.wasReplaced = true
+				beo.replaceResult = replaceComplete
 				logger.Info(
 					"Found new brick in gluster volume: %v", newBrickHostPath)
 			} else {
@@ -519,18 +719,21 @@ func (beo *BrickEvictOperation) Clean(executor executors.Executor) error {
 		return err
 	}
 
-	if beo.wasReplaced {
+	switch beo.replaceResult {
+	case replaceComplete:
 		logger.Info("Destroying old brick contents")
-		beo.reclaimed, err = old.bhmap().destroy(executor)
+		beo.reclaimed, err = tryDestroyBrickMap(old.bhmap(), executor)
 		if err != nil {
 			return logger.LogError("Error destroying old brick: %v", err)
 		}
-	} else {
+	case replaceIncomplete:
 		logger.Info("Destroying unused new brick contents")
-		beo.reclaimed, err = newBHMap.destroy(executor)
+		beo.reclaimed, err = tryDestroyBrickMap(newBHMap, executor)
 		if err != nil {
 			return logger.LogError("Error destroying new brick: %v", err)
 		}
+	default:
+		return logger.LogError("Replace state unknown")
 	}
 	return nil
 }
@@ -538,7 +741,7 @@ func (beo *BrickEvictOperation) Clean(executor executors.Executor) error {
 func (beo *BrickEvictOperation) CleanDone() error {
 	logger.Info("Clean is done for %v op:%v", beo.Label(), beo.op.Id)
 	return beo.db.Update(func(tx *bolt.Tx) error {
-		if e := beo.refreshOp(beo.db); e != nil {
+		if e := beo.refreshOp(wdb.WrapTx(tx)); e != nil {
 			return e
 		}
 		bes, err := evictStatus(beo.op)
@@ -550,14 +753,19 @@ func (beo *BrickEvictOperation) CleanDone() error {
 			logger.Debug("no new brick: operation never started")
 			return beo.finishNeverStarted(wdb.WrapTx(tx), bes)
 		}
-		if beo.wasReplaced {
+		switch beo.replaceResult {
+		case replaceComplete:
 			return beo.finishAccept(tx)
+		case replaceIncomplete:
+			return beo.finishRevert(tx)
+		default:
+			return logger.LogError("Replace state unknown (was clean not executed)")
 		}
-		return beo.finishRevert(tx)
 	})
 }
 
 func (beo *BrickEvictOperation) finishNeverStarted(db wdb.DB, bes brickEvictStatus) error {
+	logger.Debug("finishing operation: no changes")
 	return db.Update(func(tx *bolt.Tx) error {
 		b, err := NewBrickEntryFromId(tx, bes.oldBrickId)
 		if err != nil {
@@ -572,6 +780,9 @@ func (beo *BrickEvictOperation) finishNeverStarted(db wdb.DB, bes brickEvictStat
 }
 
 func (beo *BrickEvictOperation) finishAccept(tx *bolt.Tx) error {
+	logger.Debug(
+		"finishing operation: accepting new brick [%v]",
+		beo.newBrickEntryId)
 	old, err := beo.current(beo.db)
 	if err != nil {
 		return err
@@ -588,7 +799,7 @@ func (beo *BrickEvictOperation) finishAccept(tx *bolt.Tx) error {
 	}
 	// update (new) device with new brick
 	// reminder: New brick function takes space from device (!!!)
-	newDevice, err := NewDeviceEntryFromId(tx, beo.newDeviceEntryId)
+	newDevice, err := NewDeviceEntryFromId(tx, newBrick.Info.DeviceId)
 	if err != nil {
 		return err
 	}
@@ -613,6 +824,9 @@ func (beo *BrickEvictOperation) finishAccept(tx *bolt.Tx) error {
 }
 
 func (beo *BrickEvictOperation) finishRevert(tx *bolt.Tx) error {
+	logger.Debug(
+		"finishing operation: reverting new brick [%s]",
+		beo.newBrickEntryId)
 	old, err := beo.current(beo.db)
 	if err != nil {
 		return err
@@ -655,12 +869,175 @@ func evictStatus(op *PendingOperationEntry) (brickEvictStatus, error) {
 		case OpAddBrick:
 			logger.Info("found replacement brick: %v", action.Id)
 			bes.newBrickId = action.Id
+		case OpParentOperation:
+			logger.Info("this is a child op of: %v", action.Id)
 		default:
-			logger.Info("found invalied action: %v, %v",
+			logger.Info("found invalid action: %v, %v",
 				action.Change, action.Id)
 			return bes, fmt.Errorf(
 				"Malformed pending operation entry for brick evict operation")
 		}
 	}
 	return bes, nil
+}
+
+// removeBrickComboOperation are ephemeral operations that combine
+// db changes for the parent operation (device remove) and child
+// (brick evict) such that certain changes to both are made within
+// a single db transaction but we can still re-use as much of the
+// existing functions from the child.
+type removeBrickComboOperation struct {
+	noRetriesOperation
+
+	deviceRemoveOp *DeviceRemoveOperation
+	brickEvictOp   *BrickEvictOperation
+}
+
+func newRemoveBrickComboOperation(dro *DeviceRemoveOperation, beo *BrickEvictOperation) *removeBrickComboOperation {
+
+	return &removeBrickComboOperation{
+		deviceRemoveOp: dro,
+		brickEvictOp:   beo,
+	}
+}
+
+func (bco *removeBrickComboOperation) Id() string {
+	return bco.deviceRemoveOp.Id()
+}
+
+func (bco *removeBrickComboOperation) Label() string {
+	return "Remove Brick from Device"
+}
+
+func (bco *removeBrickComboOperation) ResourceUrl() string {
+	return ""
+}
+
+func (bco *removeBrickComboOperation) childPushDB(db wdb.DB) {
+	// tad bit hacky
+	bco.brickEvictOp.db = db
+}
+
+func (bco *removeBrickComboOperation) childPopDB() {
+	bco.brickEvictOp.db = bco.deviceRemoveOp.db
+}
+
+func (bco *removeBrickComboOperation) Build() error {
+	beo := bco.brickEvictOp
+	dro := bco.deviceRemoveOp
+	return dro.db.Update(func(tx *bolt.Tx) error {
+		txdb := wdb.WrapTx(tx)
+		bco.childPushDB(txdb)
+		defer bco.childPopDB()
+		if err := beo.Build(); err != nil {
+			return fmt.Errorf(
+				"failed to construct brick-evict for device remove (%v): %v",
+				dro.op.Id,
+				err)
+		}
+		if err := dro.updateChildOperation(txdb, beo.op); err != nil {
+			return fmt.Errorf(
+				"failed to add brick-evict as child op for device remove (%v): %v",
+				dro.op.Id,
+				err)
+		}
+		return nil
+	})
+}
+
+func (bco *removeBrickComboOperation) Exec(executor executors.Executor) error {
+	return bco.brickEvictOp.Exec(executor)
+}
+
+func (bco *removeBrickComboOperation) Clean(executor executors.Executor) error {
+	return bco.brickEvictOp.Clean(executor)
+}
+
+func (bco *removeBrickComboOperation) Rollback(executor executors.Executor) error {
+	return rollbackViaClean(bco, executor)
+}
+
+func (bco *removeBrickComboOperation) CleanDone() error {
+	beo := bco.brickEvictOp
+	dro := bco.deviceRemoveOp
+	return dro.db.Update(func(tx *bolt.Tx) error {
+		txdb := wdb.WrapTx(tx)
+		bco.childPushDB(txdb)
+		defer bco.childPopDB()
+		if err := beo.CleanDone(); err != nil {
+			return fmt.Errorf(
+				"failed to complete clean of child op (%v): %v",
+				beo.op.Id,
+				err)
+		}
+		if err := dro.clearChildOperation(txdb); err != nil {
+			return fmt.Errorf(
+				"failed to clear child op [%v] from pending op [%v]: %v",
+				beo.op.Id,
+				dro.op.Id,
+				err)
+		}
+		return nil
+	})
+}
+
+func (bco *removeBrickComboOperation) Finalize() error {
+	beo := bco.brickEvictOp
+	dro := bco.deviceRemoveOp
+	return dro.db.Update(func(tx *bolt.Tx) error {
+		txdb := wdb.WrapTx(tx)
+		bco.childPushDB(txdb)
+		defer bco.childPopDB()
+		if err := beo.Finalize(); err != nil {
+			return fmt.Errorf(
+				"failed to finalize child op (%v): %v",
+				beo.op.Id,
+				err)
+		}
+		if err := dro.clearChildOperation(txdb); err != nil {
+			return fmt.Errorf(
+				"failed to clear child op [%v] from pending op [%v]: %v",
+				beo.op.Id,
+				dro.op.Id,
+				err)
+		}
+		return nil
+	})
+}
+
+func getWorkingNode(n *NodeEntry, db wdb.RODB, executor executors.Executor) (string, error) {
+	node := n.ManageHostName()
+	err := executor.GlusterdCheck(node)
+	if err != nil {
+		node, err = GetVerifiedManageHostname(db, executor, n.Info.NodeAddRequest.ClusterId)
+		if err != nil {
+			return "", err
+		}
+	}
+	return node, err
+}
+
+func tryDestroyBrickMap(bhmap brickHostMap, executor executors.Executor) (ReclaimMap, error) {
+	reclaimed, err := bhmap.destroy(executor)
+	if err == nil {
+		return reclaimed, nil
+	}
+
+	// If the destroy failed because the node is not running (ideally,
+	// permanently down) we want to continue with the operation . But if the
+	// node works we failed for a "real" reason we don't want to blindly ignore
+	// errors. So we do a probe to see if the host is responsive. If the
+	// destroy has failed we will use the node's responsiveness to decide if
+	// this should be treated as a failure or not.  It is bit hacky but should
+	// work around the lack of proper error handling in most common cases.
+	for b, node := range bhmap {
+		destroyErr := logger.LogError("Error destroying brick [%v]: %v", b, err)
+		err := executor.GlusterdCheck(node)
+		if err == nil {
+			logger.Warning("node [%v] responds to probe: failing operation", node)
+			return reclaimed, destroyErr
+		}
+		logger.Warning("node [%v] does not respond to probe: ignoring error destroying bricks", node)
+	}
+	return reclaimed, nil
 }
